@@ -22,12 +22,13 @@
             "matchPackageNames": [
                 "tokio"
             ],
-            "ignoreUpdateTypes": [
+            "matchUpdateTypes": [
                 "minor",
                 "patch",
                 "pin",
                 "digest"
-            ]
+            ],
+            "enabled": false
         }
     ],
     "lockFileMaintenance": {
