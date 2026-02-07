@@ -23,5 +23,6 @@
         "enabled": true,
         "automerge": true
     },
-    "rangeStrategy": "bump"
+    "rangeStrategy": "bump",
+    "forkProcessing": "enabled"
 }
