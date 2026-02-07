@@ -98,7 +98,7 @@
 #[cfg(test)]
 mod tests;
 
-use crossbeam_channel::{Receiver, Sender};
+use crossfire::{mpsc, MTx, Rx, SendError};
 use std::{
     fmt::{self, Debug, Display},
     path::Path,
@@ -156,6 +156,8 @@ impl From<rusqlite::Error> for Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 type CallFn = Box<dyn FnOnce(&mut rusqlite::Connection) + Send + 'static>;
+type MessageSender = MTx<mpsc::List<Message>>;
+type MessageReceiver = Rx<mpsc::List<Message>>;
 
 enum Message {
     Execute(CallFn),
@@ -165,7 +167,7 @@ enum Message {
 /// A handle to call functions in background thread.
 #[derive(Clone)]
 pub struct Connection {
-    sender: Sender<Message>,
+    sender: MessageSender,
 }
 
 impl Connection {
@@ -347,7 +349,7 @@ impl Connection {
     pub async fn close(self) -> Result<()> {
         let (sender, receiver) = oneshot::channel::<std::result::Result<(), rusqlite::Error>>();
 
-        if let Err(crossbeam_channel::SendError(_)) = self.sender.send(Message::Close(sender)) {
+        if let Err(SendError(_)) = self.sender.send(Message::Close(sender)) {
             // If the channel is closed on the other side, it means the connection closed successfully
             // This is a safeguard against calling close on a `Copy` of the connection
             return Ok(());
@@ -373,7 +375,7 @@ impl Debug for Connection {
 
 impl From<rusqlite::Connection> for Connection {
     fn from(conn: rusqlite::Connection) -> Self {
-        let (sender, receiver) = crossbeam_channel::unbounded::<Message>();
+        let (sender, receiver) = mpsc::unbounded_blocking::<Message>();
         thread::spawn(move || event_loop(conn, receiver));
 
         Self { sender }
@@ -384,7 +386,7 @@ async fn start<F>(open: F) -> rusqlite::Result<Connection>
 where
     F: FnOnce() -> rusqlite::Result<rusqlite::Connection> + Send + 'static,
 {
-    let (sender, receiver) = crossbeam_channel::unbounded::<Message>();
+    let (sender, receiver) = mpsc::unbounded_blocking::<Message>();
     let (result_sender, result_receiver) = oneshot::channel();
 
     thread::spawn(move || {
@@ -409,7 +411,7 @@ where
         .map(|_| Connection { sender })
 }
 
-fn event_loop(mut conn: rusqlite::Connection, receiver: Receiver<Message>) {
+fn event_loop(mut conn: rusqlite::Connection, receiver: MessageReceiver) {
     while let Ok(message) = receiver.recv() {
         match message {
             Message::Execute(f) => f(&mut conn),
