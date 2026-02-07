@@ -17,6 +17,17 @@
                 "digest"
             ],
             "automerge": true
+        },
+        {
+            "matchPackageNames": [
+                "tokio"
+            ],
+            "ignoreUpdateTypes": [
+                "minor",
+                "patch",
+                "pin",
+                "digest"
+            ]
         }
     ],
     "lockFileMaintenance": {
