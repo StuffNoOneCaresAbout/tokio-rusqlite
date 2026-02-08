@@ -98,13 +98,12 @@
 #[cfg(test)]
 mod tests;
 
-use crossfire::{mpsc, MTx, Rx, SendError};
+use crossfire::{mpsc, oneshot, MTx, Rx, SendError};
 use std::{
     fmt::{self, Debug, Display},
     path::Path,
     thread,
 };
-use tokio::sync::oneshot::{self};
 
 pub use rusqlite::{self, *};
 
@@ -155,13 +154,40 @@ impl From<rusqlite::Error> for Error {
 /// The result returned on method calls in this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
-type CallFn = Box<dyn FnOnce(&mut rusqlite::Connection) + Send + 'static>;
 type MessageSender = MTx<mpsc::List<Message>>;
 type MessageReceiver = Rx<mpsc::List<Message>>;
+type CloseSender = oneshot::TxOneshot<std::result::Result<(), rusqlite::Error>>;
+type TaskFn = Box<dyn Task>;
+
+trait Task: Send + 'static {
+    fn run(self: Box<Self>, conn: &mut rusqlite::Connection);
+    fn fail(self: Box<Self>);
+}
+
+struct ExecuteTask<F, R> {
+    func: F,
+    reply: oneshot::TxOneshot<R>,
+}
+
+impl<F, R> Task for ExecuteTask<F, R>
+where
+    F: FnOnce(&mut rusqlite::Connection) -> R + Send + 'static,
+    R: Send + 'static,
+{
+    fn run(self: Box<Self>, conn: &mut rusqlite::Connection) {
+        let ExecuteTask { func, reply } = *self;
+        let value = func(conn);
+        let _ = reply.send(value);
+    }
+
+    fn fail(self: Box<Self>) {
+        drop(self);
+    }
+}
 
 enum Message {
-    Execute(CallFn),
-    Close(oneshot::Sender<std::result::Result<(), rusqlite::Error>>),
+    Execute(TaskFn),
+    Close(CloseSender),
 }
 
 /// A handle to call functions in background thread.
@@ -294,13 +320,14 @@ impl Connection {
         F: FnOnce(&mut rusqlite::Connection) -> R + 'static + Send,
         R: Send + 'static,
     {
-        let (sender, receiver) = oneshot::channel::<R>();
+        let (sender, receiver) = oneshot::oneshot::<R>();
+        let task = ExecuteTask {
+            func: function,
+            reply: sender,
+        };
 
         self.sender
-            .send(Message::Execute(Box::new(move |conn| {
-                let value = function(conn);
-                let _ = sender.send(value);
-            })))
+            .send(Message::Execute(Box::new(task)))
             .map_err(|_| Error::ConnectionClosed)?;
 
         receiver.await.map_err(|_| Error::ConnectionClosed)
@@ -319,13 +346,14 @@ impl Connection {
         F: FnOnce(&mut rusqlite::Connection) -> R + Send + 'static,
         R: Send + 'static,
     {
-        let (sender, receiver) = oneshot::channel::<R>();
+        let (sender, receiver) = oneshot::oneshot::<R>();
+        let task = ExecuteTask {
+            func: function,
+            reply: sender,
+        };
 
         self.sender
-            .send(Message::Execute(Box::new(move |conn| {
-                let value = function(conn);
-                let _ = sender.send(value);
-            })))
+            .send(Message::Execute(Box::new(task)))
             .expect("database connection should be open");
 
         receiver.await.expect(BUG_TEXT)
@@ -347,7 +375,7 @@ impl Connection {
     ///
     /// Will return `Err` if the underlying SQLite close call fails.
     pub async fn close(self) -> Result<()> {
-        let (sender, receiver) = oneshot::channel::<std::result::Result<(), rusqlite::Error>>();
+        let (sender, receiver) = oneshot::oneshot::<std::result::Result<(), rusqlite::Error>>();
 
         if let Err(SendError(_)) = self.sender.send(Message::Close(sender)) {
             // If the channel is closed on the other side, it means the connection closed successfully
@@ -387,20 +415,18 @@ where
     F: FnOnce() -> rusqlite::Result<rusqlite::Connection> + Send + 'static,
 {
     let (sender, receiver) = mpsc::unbounded_blocking::<Message>();
-    let (result_sender, result_receiver) = oneshot::channel();
+    let (result_sender, result_receiver) = oneshot::oneshot();
 
     thread::spawn(move || {
         let conn = match open() {
             Ok(c) => c,
             Err(e) => {
-                let _ = result_sender.send(Err(e));
+                result_sender.send(Err(e));
                 return;
             }
         };
 
-        if let Err(_e) = result_sender.send(Ok(())) {
-            return;
-        }
+        result_sender.send(Ok(()));
 
         event_loop(conn, receiver);
     });
@@ -414,18 +440,30 @@ where
 fn event_loop(mut conn: rusqlite::Connection, receiver: MessageReceiver) {
     while let Ok(message) = receiver.recv() {
         match message {
-            Message::Execute(f) => f(&mut conn),
+            Message::Execute(task) => task.run(&mut conn),
             Message::Close(s) => {
                 let result = conn.close();
 
                 match result {
                     Ok(v) => {
-                        s.send(Ok(v)).expect(BUG_TEXT);
+                        s.send(Ok(v));
+                        // drain the channel to make sure all pending tasks are dropped
+                        loop {
+                            match receiver.try_recv() {
+                                Ok(message) => match message {
+                                    Message::Execute(task) => task.fail(),
+                                    Message::Close(sender) => {
+                                        sender.send(Ok(()));
+                                    }
+                                },
+                                Err(_) => break,
+                            }
+                        }
                         break;
                     }
                     Err((c, e)) => {
                         conn = c;
-                        s.send(Err(e)).expect(BUG_TEXT);
+                        s.send(Err(e));
                     }
                 }
             }
