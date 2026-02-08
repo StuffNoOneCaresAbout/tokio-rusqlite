@@ -177,7 +177,7 @@ where
     fn run(self: Box<Self>, conn: &mut rusqlite::Connection) {
         let ExecuteTask { func, reply } = *self;
         let value = func(conn);
-        let _ = reply.send(value);
+        reply.send(value);
     }
 
     fn fail(self: Box<Self>) {
@@ -448,15 +448,12 @@ fn event_loop(mut conn: rusqlite::Connection, receiver: MessageReceiver) {
                     Ok(v) => {
                         s.send(Ok(v));
                         // drain the channel to make sure all pending tasks are dropped
-                        loop {
-                            match receiver.try_recv() {
-                                Ok(message) => match message {
-                                    Message::Execute(task) => task.fail(),
-                                    Message::Close(sender) => {
-                                        sender.send(Ok(()));
-                                    }
-                                },
-                                Err(_) => break,
+                        while let Ok(message) = receiver.try_recv() {
+                            match message {
+                                Message::Execute(task) => task.fail(),
+                                Message::Close(sender) => {
+                                    sender.send(Ok(()));
+                                }
                             }
                         }
                         break;
